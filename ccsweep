@@ -1,0 +1,841 @@
+#!/usr/bin/env python3
+"""ccsweep — Claude Code session RAM cleaner.
+
+Curates stale Claude Code Desktop sessions:
+  - extracts a handoff markdown from the jsonl
+  - kills the dormant claude binary process (frees RAM)
+  - moves the jsonl into ~/.claude/trash/sessions/ for 7-day grace
+  - garbage-collects trash files >= 7 days old
+
+Usage: see `ccsweep --help`.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+HOME = Path.home()
+PROJECTS_DIR = HOME / ".claude" / "projects"
+TRASH_DIR = HOME / ".claude" / "trash" / "sessions"
+PIN_FILE = HOME / ".claude" / "session-cleaner-pins.txt"
+HANDOFF_DIR = HOME / "coding-scratch"
+TRASH_GRACE_DAYS = 7
+DEFAULT_STALE_DAYS = 3
+MIN_HANDOFF_BYTES = 200
+PARENT_WALK_DEPTH = 20
+
+CLAUDE_PROC_PATTERN = re.compile(r"claude-code/[^/]+/claude\.app")
+RESUME_UUID_RE = re.compile(r"--resume\s+([a-f0-9-]{32,})")
+TODO_RE = re.compile(r"\?$|TODO|FIXME|待|未完|尚未", re.IGNORECASE | re.MULTILINE)
+COMMAND_TAG_RE = re.compile(r"<command-(name|message|args)>.*?</command-\1>", re.DOTALL)
+SYSTEM_REMINDER_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.DOTALL)
+RESTORE_SUFFIX_RE = re.compile(r"\.\d{8}T\d{6}")
+
+
+# ---------------------------------------------------------------------------
+# discovery
+# ---------------------------------------------------------------------------
+
+def decode_cwd(encoded: str) -> str:
+    """Reverse the encoded-cwd convention used by ~/.claude/projects/.
+
+    Example: '-Users-alice-my-project' -> '/Users/alice/my/project'.
+    Note: the encoding is lossy (dashes in the original cwd become slashes).
+    """
+    if not encoded:
+        return ""
+    if encoded.startswith("-"):
+        return "/" + encoded[1:].replace("-", "/")
+    return encoded.replace("-", "/")
+
+
+def discover_sessions(roots=(PROJECTS_DIR,)) -> dict:
+    """Return {uuid: {jsonl_path, mtime, encoded_cwd, decoded_cwd, in_trash}}."""
+    sessions: dict = {}
+    for root in roots:
+        if not root.exists():
+            continue
+        in_trash = root == TRASH_DIR
+        for jsonl in root.glob("*/*.jsonl"):
+            uuid = jsonl.stem
+            try:
+                mtime = jsonl.stat().st_mtime
+            except OSError:
+                continue
+            encoded_cwd = jsonl.parent.name
+            sessions[uuid] = {
+                "jsonl_path": jsonl,
+                "mtime": mtime,
+                "encoded_cwd": encoded_cwd,
+                "decoded_cwd": decode_cwd(encoded_cwd),
+                "in_trash": in_trash,
+            }
+    return sessions
+
+
+# ---------------------------------------------------------------------------
+# process linkage
+# ---------------------------------------------------------------------------
+
+def scan_processes() -> dict:
+    """Return {uuid: {pid, rss_mb}} for running claude sessions with --resume."""
+    try:
+        out = subprocess.run(
+            ["ps", "ax", "-ww", "-o", "pid=,rss=,command="],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return {}
+
+    procs: dict = {}
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if not CLAUDE_PROC_PATTERN.search(line):
+            continue
+        m = re.match(r"(\d+)\s+(\d+)\s+(.*)", line)
+        if not m:
+            continue
+        pid = int(m.group(1))
+        rss_kb = int(m.group(2))
+        cmd = m.group(3)
+        uuid_match = RESUME_UUID_RE.search(cmd)
+        if not uuid_match:
+            continue  # foreground / no --resume
+        uuid = uuid_match.group(1)
+        procs[uuid] = {"pid": pid, "rss_mb": rss_kb // 1024}
+    return procs
+
+
+def find_current_context() -> tuple[str | None, set]:
+    """Walk up the parent process tree.
+
+    Returns (foreground_session_uuid, set_of_ancestor_pids).
+    The session UUID is the closest ancestor claude proc with --resume.
+    The ancestor PID set is *every* PID we walked through, so we can hard-skip
+    them as a defense-in-depth even if cmdline parsing missed a UUID.
+    """
+    ancestors: set = set()
+    found_uuid: str | None = None
+    pid = os.getppid()
+    for _ in range(PARENT_WALK_DEPTH):
+        if pid in (0, 1):
+            break
+        ancestors.add(pid)
+        try:
+            res = subprocess.run(
+                ["ps", "-ww", "-p", str(pid), "-o", "ppid=,command="],
+                capture_output=True, text=True, timeout=5,
+            )
+        except (subprocess.SubprocessError, FileNotFoundError):
+            break
+        line = res.stdout.strip()
+        if not line:
+            break
+        parts = line.split(None, 1)
+        if len(parts) < 2:
+            break
+        try:
+            ppid = int(parts[0])
+        except ValueError:
+            break
+        cmd = parts[1]
+        if CLAUDE_PROC_PATTERN.search(cmd) and found_uuid is None:
+            m = RESUME_UUID_RE.search(cmd)
+            if m:
+                found_uuid = m.group(1).lower()
+        pid = ppid
+    return found_uuid, ancestors
+
+
+# ---------------------------------------------------------------------------
+# pin list
+# ---------------------------------------------------------------------------
+
+def load_pins() -> set:
+    if not PIN_FILE.exists():
+        return set()
+    pins: set = set()
+    for raw in PIN_FILE.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        pins.add(line.lower())
+    return pins
+
+
+def save_pins(pins: set) -> None:
+    PIN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    body = "# ccsweep pin list - one UUID (or prefix) per line\n"
+    for p in sorted(pins):
+        body += p + "\n"
+    PIN_FILE.write_text(body, encoding="utf-8")
+
+
+def is_pinned(uuid: str, pins: set) -> bool:
+    if not pins:
+        return False
+    uuid_l = uuid.lower()
+    if uuid_l in pins:
+        return True
+    for p in pins:
+        if len(p) < 32 and uuid_l.startswith(p):
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# jsonl extraction
+# ---------------------------------------------------------------------------
+
+def extract_text(content) -> str:
+    """Return human-readable text from a Claude jsonl message content field.
+
+    Skips tool_result / tool_use blocks (those are not user-facing prose).
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text" and "text" in block:
+                parts.append(str(block["text"]))
+        return "\n".join(parts)
+    return ""
+
+
+def parse_jsonl(jsonl_path: Path) -> dict:
+    """Walk a session jsonl and summarize for handoff rendering."""
+    user_msgs: list = []
+    assistant_msgs: list = []
+    files_touched: list = []
+    skills_invoked: list = []
+    first_ts = None
+    last_ts = None
+    total = 0
+
+    try:
+        fh = jsonl_path.open("r", encoding="utf-8", errors="replace")
+    except OSError as e:
+        return {"error": f"open failed: {e}"}
+
+    with fh:
+        for raw in fh:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                event = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            total += 1
+            ts = event.get("timestamp")
+            if ts:
+                if first_ts is None:
+                    first_ts = ts
+                last_ts = ts
+
+            etype = event.get("type")
+            msg = event.get("message") or {}
+            content = msg.get("content")
+
+            if etype == "user":
+                text = extract_text(content)
+                if text.strip():
+                    user_msgs.append(text)
+            elif etype == "assistant":
+                text = extract_text(content)
+                if text.strip():
+                    assistant_msgs.append(text)
+                if isinstance(content, list):
+                    for block in content:
+                        if not isinstance(block, dict):
+                            continue
+                        if block.get("type") != "tool_use":
+                            continue
+                        name = block.get("name", "")
+                        inp = block.get("input") or {}
+                        if name in ("Read", "Edit", "Write", "NotebookEdit"):
+                            fp = inp.get("file_path") or inp.get("path") or inp.get("notebook_path")
+                            if fp:
+                                files_touched.append(fp)
+                        elif name == "Skill":
+                            skill = inp.get("skill")
+                            if skill:
+                                skills_invoked.append(skill)
+
+    def dedupe(seq):
+        seen = set()
+        out = []
+        for x in seq:
+            if x not in seen:
+                seen.add(x)
+                out.append(x)
+        return out
+
+    return {
+        "user_msgs": user_msgs,
+        "assistant_msgs": assistant_msgs,
+        "files_touched": dedupe(files_touched)[:20],
+        "skills_invoked": dedupe(skills_invoked),
+        "first_ts": first_ts,
+        "last_ts": last_ts,
+        "total_events": total,
+    }
+
+
+def truncate(text: str, limit: int) -> str:
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "..."
+
+
+def clean_topic(text: str) -> str:
+    """Strip command/system-reminder noise that hides real user intent."""
+    if not text:
+        return ""
+    cleaned = COMMAND_TAG_RE.sub("", text)
+    cleaned = SYSTEM_REMINDER_RE.sub("", cleaned)
+    return cleaned.strip()
+
+
+def render_handoff(uuid: str, sess: dict, parsed: dict) -> str:
+    user_msgs = parsed.get("user_msgs", [])
+    assistant_msgs = parsed.get("assistant_msgs", [])
+
+    topic_src = clean_topic(user_msgs[0]) if user_msgs else ""
+    topic = truncate(topic_src or "(no user message detected)", 400)
+    title = truncate(topic_src or uuid[:8], 80)
+
+    last_users = user_msgs[-3:]
+    last_user_lines = []
+    base_idx = len(user_msgs) - len(last_users)
+    for offset, msg in enumerate(last_users):
+        idx = base_idx + offset + 1
+        last_user_lines.append(f"> [{idx}] {truncate(clean_topic(msg), 500)}")
+
+    last_assistant = assistant_msgs[-1] if assistant_msgs else ""
+    last_assistant_excerpt = truncate(last_assistant, 1000) or "(no assistant turn captured)"
+
+    files = parsed.get("files_touched") or []
+    files_block = "\n".join(f"- `{p}`" for p in files) or "- (none detected)"
+
+    skills = parsed.get("skills_invoked") or []
+    skills_block = "\n".join(f"- {s}" for s in skills) or "- (none detected)"
+
+    open_q = "(none detected — manual review needed)"
+    if last_assistant and TODO_RE.search(last_assistant):
+        snippets = []
+        for line in last_assistant.splitlines():
+            stripped = line.strip()
+            if stripped and TODO_RE.search(stripped):
+                snippets.append(truncate(stripped, 200))
+            if len(snippets) >= 5:
+                break
+        if snippets:
+            open_q = "\n".join(f"- {s}" for s in snippets)
+
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    frontmatter = (
+        "---\n"
+        "type: cc-session-handoff\n"
+        f"session_uuid: {uuid}\n"
+        f"cwd: {sess['decoded_cwd']}\n"
+        f"first_msg_at: {parsed.get('first_ts') or 'unknown'}\n"
+        f"last_msg_at: {parsed.get('last_ts') or 'unknown'}\n"
+        f"total_events: {parsed.get('total_events', 0)}\n"
+        "archived_by: ccsweep\n"
+        f"archived_at: {now}\n"
+        "---\n\n"
+    )
+
+    body = (
+        f"# CC Session Handoff — {title}\n\n"
+        "## Topic\n"
+        f"{topic}\n\n"
+        "## Resume hint\n"
+        "```bash\n"
+        f"cd {sess['decoded_cwd']}\n"
+        f"claude --resume {uuid}\n"
+        "```\n"
+        "(jsonl 超過 30 天 auto-retention 後 resume 會失敗；在 trash 內未過 7 天可先 `ccsweep --restore`)\n\n"
+        "## Last user messages\n"
+        f"{chr(10).join(last_user_lines) or '> (none)'}\n\n"
+        "## Last assistant turn (excerpt)\n"
+        f"{last_assistant_excerpt}\n\n"
+        "## Files touched\n"
+        f"{files_block}\n\n"
+        "## Skills invoked\n"
+        f"{skills_block}\n\n"
+        "## Open questions / TODO (heuristic)\n"
+        f"{open_q}\n"
+    )
+    return frontmatter + body
+
+
+# ---------------------------------------------------------------------------
+# archive operations
+# ---------------------------------------------------------------------------
+
+def kill_proc(pid: int) -> tuple[bool, str]:
+    if not pid:
+        return True, "no proc"
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True, "already gone"
+    except PermissionError as e:
+        return False, f"permission denied: {e}"
+    except OSError as e:
+        return False, f"kill failed: {e}"
+    # wait for graceful exit
+    for _ in range(20):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True, "killed"
+        time.sleep(0.1)
+    # escalate
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return True, "killed"
+    except OSError as e:
+        return False, f"SIGKILL failed: {e}"
+    return True, "killed (SIGKILL)"
+
+
+def move_to_trash(jsonl_path: Path, encoded_cwd: str) -> Path:
+    dest_dir = TRASH_DIR / encoded_cwd
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / jsonl_path.name
+    if dest.exists():
+        stamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+        dest = dest_dir / f"{jsonl_path.stem}.{stamp}.jsonl"
+    shutil.move(str(jsonl_path), str(dest))
+    return dest
+
+
+def handoff_path_for(uuid: str) -> Path:
+    today = datetime.now().strftime("%Y-%m-%d")
+    return HANDOFF_DIR / f"{today}-cc-session-{uuid[:8]}-handoff.md"
+
+
+def archive_session(uuid: str, sess: dict, proc_info) -> tuple[bool, int, str]:
+    """Run the full archive cycle for one session.
+
+    Returns (ok, freed_mb, msg).
+    """
+    parsed = parse_jsonl(sess["jsonl_path"])
+    if "error" in parsed:
+        return False, 0, f"jsonl parse failed: {parsed['error']}"
+
+    handoff_md = render_handoff(uuid, sess, parsed)
+    handoff_path = handoff_path_for(uuid)
+    handoff_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        handoff_path.write_text(handoff_md, encoding="utf-8")
+    except OSError as e:
+        return False, 0, f"handoff write failed: {e}"
+
+    try:
+        size = handoff_path.stat().st_size
+    except OSError as e:
+        return False, 0, f"handoff verify failed: {e}"
+    if size < MIN_HANDOFF_BYTES:
+        return False, 0, f"handoff suspiciously small ({size} B); aborting kill"
+
+    freed_mb = 0
+    if proc_info:
+        ok, msg = kill_proc(proc_info["pid"])
+        if not ok:
+            return False, 0, f"kill failed ({msg}); handoff kept at {handoff_path}"
+        freed_mb = proc_info["rss_mb"]
+
+    try:
+        trash_dest = move_to_trash(sess["jsonl_path"], sess["encoded_cwd"])
+    except OSError as e:
+        return False, freed_mb, f"trash move failed: {e} (proc killed, handoff written)"
+
+    return True, freed_mb, f"handoff={handoff_path.name}, trash={trash_dest.name}"
+
+
+# ---------------------------------------------------------------------------
+# trash GC
+# ---------------------------------------------------------------------------
+
+def gc_trash(days: int = TRASH_GRACE_DAYS) -> int:
+    if not TRASH_DIR.exists():
+        return 0
+    cutoff = time.time() - days * 86400
+    removed = 0
+    for jsonl in TRASH_DIR.glob("*/*.jsonl"):
+        try:
+            if jsonl.stat().st_mtime < cutoff:
+                jsonl.unlink()
+                removed += 1
+        except OSError:
+            continue
+    _prune_empty_dirs(TRASH_DIR)
+    return removed
+
+
+def empty_trash() -> int:
+    if not TRASH_DIR.exists():
+        return 0
+    removed = 0
+    for jsonl in TRASH_DIR.glob("*/*.jsonl"):
+        try:
+            jsonl.unlink()
+            removed += 1
+        except OSError:
+            continue
+    _prune_empty_dirs(TRASH_DIR)
+    return removed
+
+
+def _prune_empty_dirs(root: Path) -> None:
+    if not root.exists():
+        return
+    for d in root.glob("*"):
+        if d.is_dir():
+            try:
+                next(d.iterdir())
+            except StopIteration:
+                try:
+                    d.rmdir()
+                except OSError:
+                    pass
+
+
+def restore(short_uuid: str) -> tuple[bool, str]:
+    if not TRASH_DIR.exists():
+        return False, "trash empty"
+    short = short_uuid.lower()
+    matches = []
+    for jsonl in TRASH_DIR.glob("*/*.jsonl"):
+        stem = jsonl.stem.lower()
+        if stem.startswith(short) or short in stem:
+            matches.append(jsonl)
+    if not matches:
+        return False, f"no trash file matching '{short_uuid}'"
+    if len(matches) > 1:
+        listing = "\n  ".join(str(m) for m in matches)
+        return False, f"ambiguous match, candidates:\n  {listing}"
+    src = matches[0]
+    encoded_cwd = src.parent.name
+    dest_dir = PROJECTS_DIR / encoded_cwd
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    base = RESTORE_SUFFIX_RE.sub("", src.name)
+    dest = dest_dir / base
+    if dest.exists():
+        return False, f"destination already exists: {dest}"
+    shutil.move(str(src), str(dest))
+    try:
+        next(src.parent.iterdir())
+    except StopIteration:
+        try:
+            src.parent.rmdir()
+        except OSError:
+            pass
+    return True, str(dest)
+
+
+# ---------------------------------------------------------------------------
+# commands
+# ---------------------------------------------------------------------------
+
+def cmd_list(args) -> int:
+    sessions = discover_sessions(roots=(PROJECTS_DIR,))
+    procs = scan_processes()
+    now = time.time()
+    rows = []
+    for uuid, sess in sessions.items():
+        proc = procs.get(uuid)
+        age_days = int((now - sess["mtime"]) // 86400)
+        rss = proc["rss_mb"] if proc else "-"
+        pid = proc["pid"] if proc else "-"
+        rows.append((age_days, pid, rss, sess["decoded_cwd"], uuid[:8]))
+    rows.sort(key=lambda r: -r[0])
+    print(f"{'AGE':<6} {'PID':<7} {'RSS_MB':<7} {'CWD':<60} UUID")
+    print("-" * 100)
+    for age, pid, rss, cwd, short in rows:
+        age_str = f"{age}d"
+        print(f"{age_str:<6} {str(pid):<7} {str(rss):<7} {cwd[:60]:<60} {short}")
+    total_rss = sum(p["rss_mb"] for p in procs.values())
+    print(f"\nTotal: {len(rows)} session(s) on disk / {len(procs)} running / {total_rss} MB RSS")
+    return 0
+
+
+def cmd_scan(args) -> int:
+    HANDOFF_DIR.mkdir(parents=True, exist_ok=True)
+    pins = load_pins()
+    sessions = discover_sessions(roots=(PROJECTS_DIR,))
+    procs = scan_processes()
+    current_uuid, ancestor_pids = find_current_context()
+    now = time.time()
+
+    candidates = []
+    orphan_skipped = 0
+    ancestor_skipped = 0
+    for uuid, sess in sessions.items():
+        age_days = (now - sess["mtime"]) / 86400
+        if age_days < args.days:
+            continue
+        if is_pinned(uuid, pins):
+            continue
+        if current_uuid and uuid.lower() == current_uuid:
+            continue
+        proc = procs.get(uuid)
+        if proc and proc["pid"] in ancestor_pids:
+            ancestor_skipped += 1
+            continue
+        if proc is None and not args.include_orphans:
+            orphan_skipped += 1
+            continue
+        candidates.append((age_days, uuid, sess, proc))
+
+    candidates.sort(key=lambda c: -c[0])
+
+    if not candidates:
+        print(f"No sessions >= {args.days} days stale with running procs.")
+        if orphan_skipped:
+            print(f"({orphan_skipped} jsonl-only orphan(s) skipped; use --include-orphans to scan them)")
+        if current_uuid:
+            print(f"(current foreground session {current_uuid[:8]} excluded)")
+        if ancestor_skipped:
+            print(f"({ancestor_skipped} ancestor-proc session(s) excluded)")
+        removed = gc_trash()
+        if removed:
+            print(f"Trash GC: removed {removed} file(s) >= {TRASH_GRACE_DAYS}d old.")
+        return 0
+
+    total = len(candidates)
+    archived = skipped = pinned_now = 0
+    freed_total = 0
+    quit_at = None
+
+    if current_uuid:
+        print(f"(current foreground session {current_uuid[:8]} auto-excluded)")
+    if ancestor_skipped:
+        print(f"({ancestor_skipped} ancestor-proc session(s) auto-excluded)")
+    if orphan_skipped:
+        print(f"({orphan_skipped} jsonl-only orphan(s) skipped; use --include-orphans to scan them)")
+    scope = "with running procs" if not args.include_orphans else "(incl. orphans)"
+    print(f"Found {total} candidate(s) >= {args.days}d stale {scope}.\n")
+
+    for i, (age, uuid, sess, proc) in enumerate(candidates, 1):
+        if args.dry_run:
+            rss = proc["rss_mb"] if proc else "-"
+            pid = proc["pid"] if proc else "-"
+            print(f"[{i}/{total}] {sess['decoded_cwd']}  ({int(age)}d, {rss} MB, PID {pid}, {uuid[:8]})")
+            continue
+
+        parsed_preview = parse_jsonl(sess["jsonl_path"])
+        users = parsed_preview.get("user_msgs", [])
+        topic_preview = truncate(clean_topic(users[0]) if users else "(no user msg)", 80)
+        last_preview = truncate(clean_topic(users[-1]) if users else "", 80)
+
+        rss_str = f"{proc['rss_mb']} MB" if proc else "no proc"
+        pid_str = f", PID {proc['pid']}" if proc else ""
+        print(f"[{i}/{total}] {sess['decoded_cwd']}  ({int(age)}d ago, {rss_str}{pid_str}, {uuid[:8]})")
+        print(f"  Topic: \"{topic_preview}\"")
+        if last_preview and last_preview != topic_preview:
+            print(f"  Last:  \"{last_preview}\"")
+
+        choice = _prompt_action(include_view=True)
+        if choice == "q":
+            quit_at = i
+            break
+        if choice == "v":
+            print(f"  jsonl: {sess['jsonl_path']}")
+            choice = _prompt_action(include_view=False)
+            if choice == "q":
+                quit_at = i
+                break
+        if choice == "s":
+            skipped += 1
+            continue
+        if choice == "p":
+            pins.add(uuid.lower())
+            save_pins(pins)
+            print(f"  pinned ({uuid[:8]}) — won't ask again")
+            pinned_now += 1
+            continue
+
+        # choice == "a"
+        ok, freed, msg = archive_session(uuid, sess, proc)
+        if ok:
+            archived += 1
+            freed_total += freed
+            print(f"  archived ({freed} MB freed) — {msg}")
+        else:
+            skipped += 1
+            print(f"  abort — {msg}")
+
+    print()
+    if quit_at:
+        print(f"Done. Archived {archived} / Skipped {skipped} / Pinned {pinned_now} / Quit at {quit_at}/{total}.")
+    else:
+        print(f"Done. Archived {archived} / Skipped {skipped} / Pinned {pinned_now} / {total} reviewed.")
+    if freed_total:
+        print(f"Freed ~{freed_total} MB RAM ({archived} proc(s) killed).")
+    if archived:
+        print(f"Wrote {archived} handoff file(s) -> {HANDOFF_DIR}/")
+    removed = gc_trash()
+    trash_now = sum(1 for _ in TRASH_DIR.glob("*/*.jsonl")) if TRASH_DIR.exists() else 0
+    print(f"Trash GC: removed {removed} file(s) >= {TRASH_GRACE_DAYS}d old; {trash_now} file(s) in trash.")
+    return 0
+
+
+def _prompt_action(include_view: bool) -> str:
+    if include_view:
+        prompt = "  [a]rchive  [s]kip  [p]in  [v]iew jsonl  [q]uit > "
+        valid = {"a", "s", "p", "v", "q"}
+    else:
+        prompt = "  [a]rchive  [s]kip  [p]in  [q]uit > "
+        valid = {"a", "s", "p", "q"}
+    while True:
+        try:
+            choice = input(prompt).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\n(interrupted)")
+            return "q"
+        if choice in valid:
+            return choice
+        print(f"  ? ({'/'.join(sorted(valid))} only)")
+
+
+def cmd_pin(args) -> int:
+    pins = load_pins()
+    target = args.pin.lower()
+    if target in pins:
+        print(f"already pinned: {target}")
+        return 0
+    pins.add(target)
+    save_pins(pins)
+    print(f"pinned: {target}")
+    return 0
+
+
+def cmd_unpin(args) -> int:
+    pins = load_pins()
+    target = args.unpin.lower()
+    if target in pins:
+        pins.remove(target)
+        save_pins(pins)
+        print(f"unpinned: {target}")
+        return 0
+    matches = [p for p in pins if p.startswith(target)]
+    if len(matches) == 1:
+        pins.remove(matches[0])
+        save_pins(pins)
+        print(f"unpinned: {matches[0]}")
+        return 0
+    if len(matches) > 1:
+        print(f"ambiguous prefix '{target}': {', '.join(matches)}")
+        return 1
+    print(f"not in pin list: {target}")
+    return 1
+
+
+def cmd_restore(args) -> int:
+    ok, msg = restore(args.restore)
+    if ok:
+        print(f"restored -> {msg}")
+        return 0
+    print(f"restore failed: {msg}")
+    return 1
+
+
+def cmd_empty_trash(args) -> int:
+    n = empty_trash()
+    print(f"emptied {n} file(s) from trash.")
+    return 0
+
+
+def cmd_gc(args) -> int:
+    n = gc_trash()
+    print(f"trash GC: removed {n} file(s) >= {TRASH_GRACE_DAYS}d old.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="ccsweep",
+        description="Claude Code session RAM cleaner — extract handoff + kill proc + 7d trash.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  ccsweep                       # interactive sweep of sessions >= 3d stale\n"
+            "  ccsweep --days 7 --dry-run    # preview only, 7d threshold\n"
+            "  ccsweep --list                # show all sessions sorted by age\n"
+            "  ccsweep --pin a1b2c3d4        # pin a session by UUID prefix\n"
+            "  ccsweep --restore a1b2c3d4    # restore a trashed session\n"
+            "  ccsweep --gc                  # GC trash files >= 7d old\n"
+        ),
+    )
+    p.add_argument("--days", type=int, default=DEFAULT_STALE_DAYS,
+                   help=f"stale threshold in days (default {DEFAULT_STALE_DAYS})")
+    p.add_argument("--include-orphans", action="store_true",
+                   help="also include jsonl-only sessions (no running proc; pure disk history)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="list candidates, take no action")
+    p.add_argument("--list", action="store_true",
+                   help="list all sessions sorted by age, then exit")
+    p.add_argument("--pin", metavar="UUID",
+                   help="add UUID (or prefix) to pin list and exit")
+    p.add_argument("--unpin", metavar="UUID",
+                   help="remove UUID (or prefix) from pin list and exit")
+    p.add_argument("--restore", metavar="SHORT_UUID",
+                   help="restore a jsonl from trash back to projects/, then exit")
+    p.add_argument("--empty-trash", action="store_true",
+                   help="immediately empty the trash (skip 7d grace) and exit")
+    p.add_argument("--gc", action="store_true",
+                   help="run trash GC only (remove files >= 7d old) and exit")
+    return p
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
+    TRASH_DIR.mkdir(parents=True, exist_ok=True)
+    if not PIN_FILE.exists():
+        save_pins(set())
+
+    if args.list:
+        return cmd_list(args)
+    if args.pin:
+        return cmd_pin(args)
+    if args.unpin:
+        return cmd_unpin(args)
+    if args.restore:
+        return cmd_restore(args)
+    if args.empty_trash:
+        return cmd_empty_trash(args)
+    if args.gc:
+        return cmd_gc(args)
+    return cmd_scan(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
