@@ -594,10 +594,10 @@ def cmd_scan(args) -> int:
     candidates = []
     orphan_skipped = 0
     ancestor_skipped = 0
+    recent_skipped = 0
+    recent_skipped_rss = 0
     for uuid, sess in sessions.items():
         age_days = (now - sess["mtime"]) / 86400
-        if age_days < args.days:
-            continue
         if is_pinned(uuid, pins):
             continue
         if current_uuid and uuid.lower() == current_uuid:
@@ -605,6 +605,11 @@ def cmd_scan(args) -> int:
         proc = procs.get(uuid)
         if proc and proc["pid"] in ancestor_pids:
             ancestor_skipped += 1
+            continue
+        if age_days < args.days and not args.include_recent:
+            if proc:
+                recent_skipped += 1
+                recent_skipped_rss += proc["rss_mb"]
             continue
         if proc is None and not args.include_orphans:
             orphan_skipped += 1
@@ -615,6 +620,9 @@ def cmd_scan(args) -> int:
 
     if not candidates:
         print(f"No sessions >= {args.days} days stale with running procs.")
+        if recent_skipped:
+            print(f"({recent_skipped} dormant session(s) <{args.days}d holding {recent_skipped_rss} MB RSS skipped; "
+                  f"use --include-recent to review them — useful for freshly-unarchived sessions you didn't end up using)")
         if orphan_skipped:
             print(f"({orphan_skipped} jsonl-only orphan(s) skipped; use --include-orphans to scan them)")
         if current_uuid:
@@ -635,10 +643,22 @@ def cmd_scan(args) -> int:
         print(f"(current foreground session {current_uuid[:8]} auto-excluded)")
     if ancestor_skipped:
         print(f"({ancestor_skipped} ancestor-proc session(s) auto-excluded)")
+    if recent_skipped:
+        print(f"({recent_skipped} dormant session(s) <{args.days}d holding {recent_skipped_rss} MB RSS skipped; "
+              f"use --include-recent to review them)")
     if orphan_skipped:
         print(f"({orphan_skipped} jsonl-only orphan(s) skipped; use --include-orphans to scan them)")
-    scope = "with running procs" if not args.include_orphans else "(incl. orphans)"
-    print(f"Found {total} candidate(s) >= {args.days}d stale {scope}.\n")
+    scope_bits = []
+    if args.include_recent:
+        scope_bits.append("incl. <" + str(args.days) + "d recent")
+    if args.include_orphans:
+        scope_bits.append("incl. orphans")
+    if scope_bits:
+        scope = "(" + ", ".join(scope_bits) + ")"
+    else:
+        scope = "with running procs"
+    age_label = f"any age" if args.include_recent else f">= {args.days}d stale"
+    print(f"Found {total} candidate(s) {age_label} {scope}.\n")
 
     for i, (age, uuid, sess, proc) in enumerate(candidates, 1):
         if args.dry_run:
@@ -799,6 +819,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help=f"stale threshold in days (default {DEFAULT_STALE_DAYS})")
     p.add_argument("--include-orphans", action="store_true",
                    help="also include jsonl-only sessions (no running proc; pure disk history)")
+    p.add_argument("--include-recent", action="store_true",
+                   help="also review dormant sessions younger than --days (catches "
+                        "freshly-unarchived sessions that bump mtime but aren't actually active)")
     p.add_argument("--dry-run", action="store_true",
                    help="list candidates, take no action")
     p.add_argument("--list", action="store_true",
