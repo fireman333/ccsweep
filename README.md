@@ -1,5 +1,7 @@
 # ccsweep
 
+**English** ・ [繁體中文](README.zh-TW.md)
+
 A safety-first CLI for cleaning up stale Claude Code Desktop sessions — extracts a handoff markdown from each session, kills its dormant process to free RAM, and parks the conversation history in a 7-day trash so you can restore it if you reach for it later.
 
 `ccsweep` is a single-file Python 3 script with **zero third-party dependencies**. It runs on macOS (where Claude Code Desktop lives) and can be dropped anywhere on your `PATH`.
